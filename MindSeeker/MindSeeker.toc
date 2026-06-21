@@ -1,0 +1,11 @@
+## Interface: 120000
+## Title: Mind-Seeker
+## Notes: Tracks your progress toward the Mind-Seeker secret (17 of 33 secrets) and shows a short guide for each. Toggle with /mind
+## Author: Raphael
+## Version: 1.0
+## SavedVariables: MindSeekerDB
+## IconTexture: Interface\ICONS\INV_Misc_Eye_01
+
+Data.lua
+Core.lua
+UI.lua
