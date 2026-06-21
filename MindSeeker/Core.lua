@@ -1,88 +1,125 @@
 local ADDON, MS = ...
 
 -- ---------------------------------------------------------------------------
--- Detection
+-- Build the entry/row model by resolving the authoritative IDs at runtime.
+-- Each entry = { name, kind, auto, id, guide, links, record }
 -- ---------------------------------------------------------------------------
 
--- Build a lowercased set of every mount name you have collected. Filter-proof
--- (reads the collected flag directly) and rebuilt on every refresh.
-function MS:BuildMountSet()
-  self.mountSet = {}
-  if not C_MountJournal then return end
-  for _, mountID in ipairs(C_MountJournal.GetMountIDs()) do
+local function petOwned(speciesID)
+  local n = C_PetJournal and C_PetJournal.GetNumCollectedInfo(speciesID)
+  return (n or 0) > 0
+end
+
+local function attachGuide(entry)
+  local g = MS:FindGuide(entry.name)
+  if g then
+    entry.guide  = g.text
+    entry.links  = g.links
+    entry.record = g.record
+  end
+  return entry
+end
+
+function MS:BuildEntries()
+  local mounts, pets, others = {}, {}, {}
+
+  for _, mountID in ipairs(self.mountIDs) do
     local name, _, _, _, _, _, _, _, _, _, collected = C_MountJournal.GetMountInfoByID(mountID)
-    if collected and name then
-      self.mountSet[name:lower()] = true
+    mounts[#mounts + 1] = attachGuide({
+      name = name or ("Mount #" .. mountID), kind = "mount",
+      auto = collected and true or false, id = mountID,
+    })
+  end
+
+  for _, speciesID in ipairs(self.petIDs) do
+    local name = C_PetJournal.GetPetInfoBySpeciesID(speciesID)
+    pets[#pets + 1] = attachGuide({
+      name = name or ("Pet #" .. speciesID), kind = "pet",
+      auto = petOwned(speciesID), id = speciesID,
+    })
+  end
+
+  for _, e in ipairs(self.extras) do
+    local auto = false
+    if e.kind == "toy" then
+      auto = PlayerHasToy(e.id) and true or false
+    elseif e.kind == "transmog" then
+      if C_TransmogCollection and C_TransmogCollection.PlayerHasTransmog then
+        auto = C_TransmogCollection.PlayerHasTransmog(e.id) and true or false
+      end
+    elseif e.kind == "achievement" then
+      auto = select(4, GetAchievementInfo(e.id)) and true or false
+    end
+    others[#others + 1] = attachGuide({
+      name = e.name, kind = e.kind, auto = auto, id = e.id,
+    })
+  end
+
+  local byName = function(a, b) return a.name < b.name end
+  table.sort(mounts, byName)
+  table.sort(pets, byName)
+
+  -- Flat entry list (for counting) + display rows (with section headers).
+  self.entries = {}
+  self.rowModel = {}
+  local function addSection(label, list)
+    self.rowModel[#self.rowModel + 1] = { header = label }
+    for _, e in ipairs(list) do
+      self.entries[#self.entries + 1] = e
+      self.rowModel[#self.rowModel + 1] = { entry = e }
     end
   end
+  addSection("Mounts", mounts)
+  addSection("Battle Pets", pets)
+  addSection("Other", others)
+
+  self.TOTAL = #self.entries
+  return self.entries
 end
 
-local function ownsPetNamed(name)
-  -- FindPetIDByName searches your owned pets and returns nil if you have none.
-  return C_PetJournal and C_PetJournal.FindPetIDByName(name) ~= nil
-end
-
--- A "collectible" record: try every candidate name against mounts and pets.
-function MS:HasCollectible(rec)
-  local candidates = { rec.name }
-  if rec.aliases then
-    for _, a in ipairs(rec.aliases) do candidates[#candidates + 1] = a end
-  end
-  for _, n in ipairs(candidates) do
-    if self.mountSet and self.mountSet[n:lower()] then return true end
-    if ownsPetNamed(n) then return true end
-  end
-  return false
-end
-
--- True if the record is satisfied by the game (ignoring any manual override).
-function MS:AutoDetect(rec)
-  local k = rec.kind
-  if k == "collectible" then
-    return self:HasCollectible(rec)
-  elseif k == "toy" then
-    return rec.id and PlayerHasToy(rec.id) or false
-  elseif k == "transmog" then
-    if rec.id and C_TransmogCollection and C_TransmogCollection.PlayerHasTransmog then
-      return C_TransmogCollection.PlayerHasTransmog(rec.id) and true or false
+-- Re-resolve the auto-detected status of every entry (cheap; call on refresh).
+function MS:RefreshStatuses()
+  for _, e in ipairs(self.entries or {}) do
+    if e.kind == "mount" then
+      e.auto = select(11, C_MountJournal.GetMountInfoByID(e.id)) and true or false
+    elseif e.kind == "pet" then
+      e.auto = petOwned(e.id)
+    elseif e.kind == "toy" then
+      e.auto = PlayerHasToy(e.id) and true or false
+    elseif e.kind == "transmog" then
+      e.auto = (C_TransmogCollection and C_TransmogCollection.PlayerHasTransmog
+                and C_TransmogCollection.PlayerHasTransmog(e.id)) and true or false
+    elseif e.kind == "achievement" then
+      e.auto = select(4, GetAchievementInfo(e.id)) and true or false
     end
-    return false
-  elseif k == "achievement" then
-    if rec.id then
-      return select(4, GetAchievementInfo(rec.id)) and true or false
-    end
-    return false
   end
-  return false -- "manual"
 end
 
 -- Final status = detected by the game OR ticked manually by the user.
-function MS:IsCollected(rec)
-  if MindSeekerDB and MindSeekerDB.manual and MindSeekerDB.manual[rec.record] then
+function MS:IsCollected(entry)
+  if MindSeekerDB and MindSeekerDB.manual and MindSeekerDB.manual[entry.name] then
     return true
   end
-  return self:AutoDetect(rec)
+  return entry.auto
 end
 
-function MS:IsManual(rec)
-  return MindSeekerDB and MindSeekerDB.manual and MindSeekerDB.manual[rec.record] == true
+function MS:IsManual(entry)
+  return MindSeekerDB and MindSeekerDB.manual and MindSeekerDB.manual[entry.name] == true
 end
 
-function MS:ToggleManual(rec)
+function MS:ToggleManual(entry)
   MindSeekerDB.manual = MindSeekerDB.manual or {}
-  if MindSeekerDB.manual[rec.record] then
-    MindSeekerDB.manual[rec.record] = nil
+  if MindSeekerDB.manual[entry.name] then
+    MindSeekerDB.manual[entry.name] = nil
   else
-    MindSeekerDB.manual[rec.record] = true
+    MindSeekerDB.manual[entry.name] = true
   end
 end
 
--- Count how many records are currently solved.
 function MS:CountSolved()
-  self:BuildMountSet()
   local n = 0
-  for _, rec in ipairs(self.records) do
-    if self:IsCollected(rec) then n = n + 1 end
+  for _, e in ipairs(self.entries or {}) do
+    if self:IsCollected(e) then n = n + 1 end
   end
   return n
 end
@@ -94,7 +131,6 @@ end
 local function InitDB()
   MindSeekerDB = MindSeekerDB or {}
   MindSeekerDB.manual = MindSeekerDB.manual or {}
-  MindSeekerDB.point  = MindSeekerDB.point or nil
 end
 
 local f = CreateFrame("Frame")
@@ -110,7 +146,7 @@ f:SetScript("OnEvent", function(_, event)
 end)
 
 -- ---------------------------------------------------------------------------
--- Slash command:  /mind  (toggle)  |  show | hide | scan | reset
+-- Slash command:  /mind  (toggle)  |  show | hide | scan | reset | dump
 -- ---------------------------------------------------------------------------
 
 SLASH_MINDSEEKER1 = "/mind"
@@ -123,12 +159,22 @@ SlashCmdList["MINDSEEKER"] = function(msg)
     MS:Hide()
   elseif msg == "scan" or msg == "refresh" then
     MS:Refresh()
-    local solved = MS:CountSolved()
-    print(("|cff66ccffMind-Seeker|r: %d/%d secrets solved (%d needed)."):format(solved, MS.TOTAL, MS.REQUIRED))
+    print(("|cff66ccffMind-Seeker|r: %d/%d secrets solved (%d needed)."):format(MS:CountSolved(), MS.TOTAL or 0, MS.REQUIRED))
   elseif msg == "reset" then
     MindSeekerDB.point = nil
     MS:ResetPosition()
     print("|cff66ccffMind-Seeker|r: window position reset.")
+  elseif msg == "dump" then
+    -- Diagnostic: print exactly what each authoritative ID resolves to.
+    print("|cff66ccffMind-Seeker|r ID dump:")
+    for _, id in ipairs(MS.mountIDs) do
+      local name, _, _, _, _, _, _, _, _, _, c = C_MountJournal.GetMountInfoByID(id)
+      print(("  mount %d = %s [%s]"):format(id, tostring(name), c and "HAVE" or "missing"))
+    end
+    for _, sid in ipairs(MS.petIDs) do
+      local name = C_PetJournal.GetPetInfoBySpeciesID(sid)
+      print(("  pet %d = %s [%s]"):format(sid, tostring(name), petOwned(sid) and "HAVE" or "missing"))
+    end
   else
     MS:Toggle()
   end
